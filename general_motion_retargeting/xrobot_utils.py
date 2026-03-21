@@ -1,4 +1,5 @@
 from rich import print
+import atexit
 
 try:
     import xrobotoolkit_sdk as xrt
@@ -12,9 +13,29 @@ import json
 import cv2
 import os
 
+_XRT_INITIALIZED = False
+
+
+def _safe_xrt_close():
+    global _XRT_INITIALIZED
+    if not _XRT_INITIALIZED:
+        return
+    try:
+        xrt.close()
+    except Exception:
+        pass
+    _XRT_INITIALIZED = False
+
+
+atexit.register(_safe_xrt_close)
+
+
 class XRobotStreamer:
     def __init__(self):
+        global _XRT_INITIALIZED
         xrt.init()
+        _XRT_INITIALIZED = True
+        self._closed = False
 
         # Joint names for reference
         self.body_joint_names = [
@@ -196,6 +217,25 @@ class XRobotStreamer:
         controller_data = self.get_controller_data()
         headset_pose = self.get_headset_pose()
         return body_pose_dict, left_hand_data, right_hand_data, controller_data, headset_pose
+
+    def close(self):
+        if self._closed:
+            return
+        _safe_xrt_close()
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class XRobotRecorder:
