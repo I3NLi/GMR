@@ -78,6 +78,8 @@ class KinematicsModel:
         self._parent_indices = []
         self._local_translation = []
         self._local_rotation = []
+        self._inertial_translation = []
+        self._body_mass = []
         self._joints = []
         self._dof_size = []
         self._dof_upper_limits = []
@@ -91,6 +93,11 @@ class KinematicsModel:
         self._parent_indices = torch.tensor(self._parent_indices, dtype=torch.long, device=self._device)
         self._local_translation = torch.tensor(np.array(self._local_translation), dtype=torch.float, device=self._device)
         self._local_rotation = torch.tensor(np.array(self._local_rotation), dtype=torch.float, device=self._device)
+        self._inertial_translation = torch.tensor(
+            np.array(self._inertial_translation), dtype=torch.float, device=self._device
+        )
+        self._body_mass = torch.tensor(np.array(self._body_mass), dtype=torch.float, device=self._device)
+        self._total_mass = torch.clamp(self._body_mass.sum(), min=1e-8)
         self._num_dof = sum(self._dof_size)
         self._dof_lower_limits = torch.tensor(self._dof_lower_limits, dtype=torch.float, device=self._device)
         self._dof_upper_limits = torch.tensor(self._dof_upper_limits, dtype=torch.float, device=self._device)
@@ -121,6 +128,13 @@ class KinematicsModel:
             rot_w = rot[..., 0].copy()
             rot[..., 0:3] = rot[..., 1:]
             rot[..., 3] = rot_w
+
+            inertial_pos = np.zeros(3, dtype=float)
+            body_mass = 0.0
+            inertial_node = xml_node.find("inertial")
+            if inertial_node is not None:
+                inertial_pos = np.fromstring(inertial_node.attrib.get("pos", "0 0 0"), dtype=float, sep=" ")
+                body_mass = float(inertial_node.attrib.get("mass", 0.0))
             
             if body_index == 0:
                 curr_joint = Joint(name=body_name, dof_dim=0, axis=None) # root
@@ -150,6 +164,8 @@ class KinematicsModel:
             self._parent_indices.append(parent_index)
             self._local_rotation.append(rot)
             self._local_translation.append(pos)
+            self._inertial_translation.append(inertial_pos)
+            self._body_mass.append(body_mass)
             self._joints.append(curr_joint)
             self._dof_size.append(curr_joint.dof_dim)
             
@@ -244,6 +260,30 @@ class KinematicsModel:
         body_rot = torch.stack(body_rot, dim=-2)
         
         return body_pos, body_rot
+
+    def compute_center_of_mass_from_fk(self, body_pos, body_rot, fitted_shape=None):
+        inertial_translation = self._inertial_translation
+        if fitted_shape is not None:
+            inertial_translation = inertial_translation * fitted_shape.unsqueeze(-1)
+
+        leading_dims = body_pos.shape[:-2]
+        view_shape = [1] * len(leading_dims) + [self.num_joint, 3]
+        inertial_translation = inertial_translation.view(*view_shape).expand(*leading_dims, self.num_joint, 3)
+
+        world_inertial_offset = torch_utils.quat_rotate(
+            body_rot.reshape(-1, 4),
+            inertial_translation.reshape(-1, 3),
+        ).reshape(*body_pos.shape[:-2], self.num_joint, 3)
+        body_com = body_pos + world_inertial_offset
+
+        mass_shape = [1] * len(leading_dims) + [self.num_joint, 1]
+        body_mass = self._body_mass.view(*mass_shape)
+        com = torch.sum(body_com * body_mass, dim=-2) / self._total_mass
+        return com
+
+    def compute_center_of_mass(self, root_pos, root_rot, dof_pos, fitted_shape=None):
+        body_pos, body_rot = self.forward_kinematics(root_pos, root_rot, dof_pos, fitted_shape=fitted_shape)
+        return self.compute_center_of_mass_from_fk(body_pos, body_rot, fitted_shape=fitted_shape)
     
     def get_body_idx(self, body_name):
         return self._body_names.index(body_name)

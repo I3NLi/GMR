@@ -79,6 +79,26 @@ class GeneralMotionRetargeting:
         self.use_ik_match_table2 = ik_config["use_ik_match_table2"]
         self.human_scale_table = ik_config["human_scale_table"]
         self.ground = ik_config["ground_height"] * np.array([0, 0, 1])
+        foot_plant = ik_config.get("foot_plant", {})
+        self.use_foot_plant = bool(foot_plant.get("enabled", False))
+        self.foot_plant_body_names = {
+            "left": foot_plant.get("left_body_name", "left_foot"),
+            "right": foot_plant.get("right_body_name", "right_foot"),
+        }
+        self.foot_plant_height_threshold = float(foot_plant.get("height_threshold", 0.03))
+        self.foot_plant_release_height = float(
+            foot_plant.get("release_height", max(0.05, self.foot_plant_height_threshold * 1.5))
+        )
+        self.foot_plant_velocity_threshold = float(foot_plant.get("velocity_threshold", 0.015))
+        self.foot_plant_release_velocity_threshold = float(
+            foot_plant.get("release_velocity_threshold", self.foot_plant_velocity_threshold * 2.0)
+        )
+        self.foot_plant_orientation_blend = float(np.clip(foot_plant.get("orientation_blend", 0.75), 0.0, 1.0))
+        self.prev_foot_positions = {}
+        self.foot_plant_state = {
+            side: {"active": False, "locked_height": None}
+            for side in ("left", "right")
+        }
 
         self.max_iter = 10
 
@@ -155,6 +175,7 @@ class GeneralMotionRetargeting:
         human_data = self.apply_ground_offset(human_data)
         if offset_to_ground:
             human_data = self.offset_human_data_to_ground(human_data)
+        human_data = self.apply_foot_plant(human_data)
         self.scaled_human_data = human_data
 
         if self.use_ik_match_table1:
@@ -232,6 +253,105 @@ class GeneralMotionRetargeting:
                 [task.compute_error(self.configuration) for task in self.tasks2]
             )
         )
+
+    def _slerp_quat_scalar_first(self, quat0, quat1, alpha):
+        quat0 = np.asarray(quat0, dtype=np.float64)
+        quat1 = np.asarray(quat1, dtype=np.float64)
+        quat0 = quat0 / np.linalg.norm(quat0)
+        quat1 = quat1 / np.linalg.norm(quat1)
+
+        dot = float(np.dot(quat0, quat1))
+        if dot < 0.0:
+            quat1 = -quat1
+            dot = -dot
+
+        if dot > 0.9995:
+            blended = quat0 + alpha * (quat1 - quat0)
+            return blended / np.linalg.norm(blended)
+
+        theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+        sin_theta_0 = np.sin(theta_0)
+        theta = theta_0 * alpha
+        s0 = np.sin(theta_0 - theta) / sin_theta_0
+        s1 = np.sin(theta) / sin_theta_0
+        return s0 * quat0 + s1 * quat1
+
+    def _level_quat_to_ground(self, quat):
+        rotation = R.from_quat(quat, scalar_first=True)
+        rotation_matrix = rotation.as_matrix()
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        forward = rotation_matrix[:, 0]
+        forward_flat = forward - np.dot(forward, up) * up
+        forward_norm = np.linalg.norm(forward_flat)
+        if forward_norm < 1e-6:
+            lateral = rotation_matrix[:, 1]
+            forward_flat = np.cross(lateral, up)
+            forward_norm = np.linalg.norm(forward_flat)
+            if forward_norm < 1e-6:
+                return quat
+
+        forward_flat = forward_flat / forward_norm
+        lateral_flat = np.cross(up, forward_flat)
+        lateral_norm = np.linalg.norm(lateral_flat)
+        if lateral_norm < 1e-6:
+            return quat
+        lateral_flat = lateral_flat / lateral_norm
+
+        leveled_rotation = np.column_stack((forward_flat, lateral_flat, up))
+        return R.from_matrix(leveled_rotation).as_quat(scalar_first=True)
+
+    def apply_foot_plant(self, human_data):
+        if not self.use_foot_plant:
+            return human_data
+
+        foot_targets = {}
+        for side, body_name in self.foot_plant_body_names.items():
+            if body_name not in human_data:
+                continue
+            pos, quat = human_data[body_name]
+            foot_targets[side] = (
+                body_name,
+                np.asarray(pos, dtype=np.float64).copy(),
+                np.asarray(quat, dtype=np.float64).copy(),
+            )
+
+        if not foot_targets:
+            return human_data
+
+        stance_floor = min(target[1][2] for target in foot_targets.values())
+
+        for side, (body_name, pos, quat) in foot_targets.items():
+            prev_pos = self.prev_foot_positions.get(side, pos)
+            velocity = np.linalg.norm(pos - prev_pos)
+            near_ground = pos[2] <= stance_floor + self.foot_plant_height_threshold
+
+            state = self.foot_plant_state[side]
+            should_release = (
+                pos[2] > stance_floor + self.foot_plant_release_height
+                or velocity > self.foot_plant_release_velocity_threshold
+            )
+            if state["active"] and should_release:
+                state["active"] = False
+                state["locked_height"] = None
+
+            if (not state["active"]) and near_ground and velocity <= self.foot_plant_velocity_threshold:
+                state["active"] = True
+                state["locked_height"] = float(pos[2])
+
+            if state["active"]:
+                state["locked_height"] = min(float(state["locked_height"]), float(pos[2]))
+                human_data[body_name][0] = pos.copy()
+                human_data[body_name][0][2] = state["locked_height"]
+                if self.foot_plant_orientation_blend > 0.0:
+                    leveled_quat = self._level_quat_to_ground(quat)
+                    human_data[body_name][1] = self._slerp_quat_scalar_first(
+                        quat, leveled_quat, self.foot_plant_orientation_blend
+                    )
+
+            self.prev_foot_positions[side] = pos.copy()
+
+        return human_data
 
 
     def to_numpy(self, human_data):
